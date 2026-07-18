@@ -3,15 +3,17 @@
 
 import os
 import json
+import time
 import requests
 from datetime import datetime
 from io import BytesIO
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Font
 
 LOW_RATING_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 LOW_RATING_THRESHOLD = 3
+LINK_FONT = Font(color="0563C1", underline="single")
 
 # ---------- НАСТРОЙКИ ----------
 BITRIX_URL = "https://24.uprav.ru/web_services/iblock/export.php"
@@ -189,6 +191,135 @@ def fetch_contacts_company_map(contact_ids):
 
 def detect_b2b(company_id):
     return "B2B" if company_id and str(company_id) != "0" else "B2C"
+
+def pick_deal_url(deals, contact_id, program_name, prefer_sdo=False):
+    """Выбирает наиболее подходящую сделку из списка сделок контакта (уже отсортированных по ID DESC)."""
+    prog = (program_name or "").strip().lower()
+    # 1) сделка, название которой пересекается с названием программы/мероприятия
+    for d in deals:
+        base = d.get("TITLE", "").split("(СДО)")[0].strip().lower()
+        if prog and base and (base in prog or prog in base):
+            return f"https://24.uprav.ru/crm/deal/details/{d['ID']}/"
+    # 2) для Teachbase (онлайн-курсы) — предпочитаем сделки дистанционного обучения (СДО)
+    if prefer_sdo:
+        for d in deals:
+            if "(СДО)" in d.get("TITLE", ""):
+                return f"https://24.uprav.ru/crm/deal/details/{d['ID']}/"
+    # 3) просто самая свежая сделка, иначе карточка контакта
+    if deals:
+        return f"https://24.uprav.ru/crm/deal/details/{deals[0]['ID']}/"
+    return f"https://24.uprav.ru/crm/contact/details/{contact_id}/" if contact_id else None
+
+def find_deal_url(email, program_name):
+    """Ищет в Bitrix сделку клиента по email (для Teachbase, где Bitrix ID контакта не известен заранее):
+    контакт -> сделки -> сделка с названием программы. Возвращает URL сделки/контакта, либо None."""
+    if not email or not BITRIX_WEBHOOK:
+        return None
+    try:
+        resp = requests.post(f"{BITRIX_WEBHOOK}/crm.contact.list.json",
+                             json={"filter": {"EMAIL": email}, "select": ["ID"]},
+                             verify=False, timeout=30)
+        resp.raise_for_status()
+        contacts = resp.json().get("result", [])
+        if not contacts:
+            return None
+        contact_id = contacts[0]["ID"]
+        resp = requests.post(f"{BITRIX_WEBHOOK}/crm.deal.list.json",
+                             json={"filter": {"CONTACT_ID": contact_id},
+                                   "select": ["ID", "TITLE"], "order": {"ID": "DESC"}},
+                             verify=False, timeout=30)
+        resp.raise_for_status()
+        deals = resp.json().get("result", [])
+        return pick_deal_url(deals, contact_id, program_name, prefer_sdo=True)
+    except Exception as e:
+        print(f"  Не удалось найти сделку для {email}: {e}")
+        return None
+
+def fetch_deals_by_contacts(contact_ids):
+    """Батч-запрос сделок сразу по списку ID контактов Bitrix. Возвращает {contact_id: [deals...]}."""
+    contact_ids = sorted({str(cid) for cid in contact_ids if cid})
+    if not contact_ids or not BITRIX_WEBHOOK:
+        return {}
+    deals_by_contact = {}
+    try:
+        for i in range(0, len(contact_ids), 50):
+            chunk = contact_ids[i:i + 50]
+            resp = requests.post(f"{BITRIX_WEBHOOK}/crm.deal.list.json",
+                                 json={"filter": {"CONTACT_ID": chunk},
+                                       "select": ["ID", "TITLE", "CONTACT_ID"],
+                                       "order": {"ID": "DESC"}},
+                                 verify=False, timeout=30)
+            resp.raise_for_status()
+            for d in resp.json().get("result", []):
+                deals_by_contact.setdefault(d["CONTACT_ID"], []).append(d)
+    except Exception as e:
+        print(f"Ошибка при запросе crm.deal.list: {e}")
+    return deals_by_contact
+
+def add_client_deal_links(wb, sheet_name, contact_ids_by_id, event_names_by_id, deals_by_contact, client_col):
+    """Проставляет гиперссылку на сделку в колонке «Клиент» везде, где её ещё нет
+    (сопоставление — по скрытому ID записи, последняя колонка). Идемпотентно: можно
+    вызывать на каждом запуске — уже проставленные ссылки не трогает, донаставляет
+    только для строк, для которых есть данные о контакте (текущий месяц)."""
+    if sheet_name not in wb.sheetnames:
+        return
+    ws = wb[sheet_name]
+    # Колонку ID ищем по заголовку, а не по max_column: в листе могут быть «призрачные»
+    # пустые колонки с сохранённым форматированием, из-за которых max_column больше реального.
+    id_col = next((c for c in range(1, ws.max_column + 1) if ws.cell(row=1, column=c).value == "ID"), None)
+    if id_col is None:
+        print(f"Лист '{sheet_name}': не найдена колонка ID, ссылки не проставлены")
+        return
+    added = 0
+    for row in ws.iter_rows(min_row=2):
+        row_id = row[id_col - 1].value
+        if row_id is None:
+            continue
+        row_id = str(row_id)
+        client_cell = row[client_col - 1]
+        if client_cell.hyperlink:
+            continue
+        contact_id = str(contact_ids_by_id.get(row_id, ""))
+        if not contact_id:
+            continue
+        url = pick_deal_url(deals_by_contact.get(contact_id, []), contact_id,
+                            event_names_by_id.get(row_id, ""))
+        if url:
+            client_cell.hyperlink = url
+            client_cell.font = LINK_FONT
+            added += 1
+    if added:
+        print(f"Лист '{sheet_name}': проставлено ссылок на сделки: {added}")
+
+def add_tb_deal_links(wb, sheet_name):
+    """Проставляет гиперссылки на сделку в колонке «Слушатель» листа Teachbase
+    (только там, где ссылки ещё нет; значения ячеек не меняются)."""
+    if sheet_name not in wb.sheetnames:
+        return
+    ws = wb[sheet_name]
+    col_event = list(TB_FIELDS_MAP).index("EVENT") + 1
+    col_client = list(TB_FIELDS_MAP).index("CLIENT") + 1
+    col_email = list(TB_FIELDS_MAP).index("EMAIL") + 1
+    cache = {}
+    added = 0
+    for row in ws.iter_rows(min_row=2):
+        client_cell = row[col_client - 1]
+        if client_cell.value in (None, "") or client_cell.hyperlink:
+            continue
+        email = str(row[col_email - 1].value or "").strip()
+        program = str(row[col_event - 1].value or "").strip()
+        if not email:
+            continue
+        key = (email, program)
+        if key not in cache:
+            cache[key] = find_deal_url(email, program)
+        url = cache[key]
+        if url:
+            client_cell.hyperlink = url
+            client_cell.font = LINK_FONT
+            added += 1
+    if added:
+        print(f"Лист '{sheet_name}': проставлено ссылок на сделки: {added}")
 
 # ---------- TEACHBASE ----------
 def get_teachbase_token():
@@ -419,11 +550,24 @@ def get_upload_link(token, disk_path):
     resp.raise_for_status()
     return resp.json()["href"]
 
-def upload_file(token, disk_path, file_buffer):
-    upload_url = get_upload_link(token, disk_path)
-    resp = requests.put(upload_url, data=file_buffer)
-    resp.raise_for_status()
-    print(f"Файл {disk_path} успешно загружен")
+def upload_file(token, disk_path, file_buffer, retries=6, retry_delay=300):
+    """Загружает файл на Яндекс.Диск. Если файл заблокирован (423 — открыт кем-то
+    в веб-редакторе), повторяет попытку с паузой: лок обычно временный."""
+    for attempt in range(1, retries + 1):
+        try:
+            file_buffer.seek(0)
+            upload_url = get_upload_link(token, disk_path)
+            resp = requests.put(upload_url, data=file_buffer)
+            resp.raise_for_status()
+            print(f"Файл {disk_path} успешно загружен")
+            return
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 423 and attempt < retries:
+                print(f"Файл заблокирован (кто-то держит его открытым), попытка {attempt}/{retries}, "
+                      f"повтор через {retry_delay // 60} мин...")
+                time.sleep(retry_delay)
+                continue
+            raise
 
 def download_existing_workbook(token, file_path):
     """Скачивает существующий файл с Яндекс.Диска. Если файла нет – возвращает None."""
@@ -478,6 +622,9 @@ def update_or_create_sheet(wb, sheet_name, headers, rows, ids, low_rating_cells=
         next_row += 1
         appended += 1
 
+    # Закрепляем строку заголовков
+    ws.freeze_panes = "A2"
+
     # Автоширина (кроме скрытой колонки ID)
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
@@ -528,7 +675,15 @@ def main():
     rev_headers, rev_rows, rev_ids = parse_reviews_data(reviews_raw)
     ank_headers, ank_rows, ank_ids, ank_low_rating_cells = parse_ankets_data(ankets_raw)
 
-    # 2.1 Определяем B2B/B2C по COMPANY_ID контакта (последний элемент каждой строки — временно ID контакта)
+    # 2.1 Определяем B2B/B2C по COMPANY_ID контакта (последний элемент каждой строки — временно ID контакта).
+    # Заодно запоминаем ID контакта и название мероприятия по каждой строке — понадобится для ссылок на сделку.
+    rev_event_col = list(REVIEWS_FIELDS_MAP).index("EVENT")
+    ank_event_col = list(ANKETS_FIELDS_MAP).index("EVENT")
+    rev_contact_by_id = {str(rid): row[-1] for rid, row in zip(rev_ids, rev_rows)}
+    rev_event_by_id = {str(rid): row[rev_event_col] for rid, row in zip(rev_ids, rev_rows)}
+    ank_contact_by_id = {str(rid): row[-1] for rid, row in zip(ank_ids, ank_rows)}
+    ank_event_by_id = {str(rid): row[ank_event_col] for rid, row in zip(ank_ids, ank_rows)}
+
     all_contact_ids = [row[-1] for row in rev_rows] + [row[-1] for row in ank_rows]
     company_by_contact = fetch_contacts_company_map(all_contact_ids)
     for row in rev_rows:
@@ -559,6 +714,16 @@ def main():
     update_or_create_sheet(wb, sheet_reviews, rev_headers, rev_rows, rev_ids)
     update_or_create_sheet(wb, sheet_ankets, ank_headers, ank_rows, ank_ids, ank_low_rating_cells)
     update_or_create_sheet(wb, sheet_tb, tb_headers, tb_rows, tb_ids, tb_low_rating_cells)
+    add_tb_deal_links(wb, sheet_tb)
+
+    # 4.1 Ссылки на сделку клиента в колонке «Клиент» листов отзывов/анкет (везде, где ссылки ещё нет)
+    deals_by_contact = fetch_deals_by_contacts(all_contact_ids)
+    rev_client_col = list(REVIEWS_FIELDS_MAP).index("CLIENT") + 1
+    ank_client_col = list(ANKETS_FIELDS_MAP).index("CLIENT") + 1
+    add_client_deal_links(wb, sheet_reviews, rev_contact_by_id, rev_event_by_id,
+                          deals_by_contact, rev_client_col)
+    add_client_deal_links(wb, sheet_ankets, ank_contact_by_id, ank_event_by_id,
+                          deals_by_contact, ank_client_col)
 
     # 5. Сохраняем и загружаем на Яндекс.Диск
     with BytesIO() as buf:
