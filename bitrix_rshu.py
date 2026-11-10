@@ -18,6 +18,7 @@ LINK_FONT = Font(color="0563C1", underline="single")
 # ---------- НАСТРОЙКИ ----------
 BITRIX_URL = "https://24.uprav.ru/web_services/iblock/export.php"
 STATIC_SECRET = "14b0fc053c141e47a5974b3859f5753f"
+SALE_CATEGORY_ID = 0  # воронка «Sale» — только в ней ищем сделку клиента для ссылок в отчёте
 
 YANDEX_FILE_PATH = "/Bitrix_отчеты.xlsx"
 
@@ -225,7 +226,7 @@ def find_deal_url(email, program_name):
             return None
         contact_id = contacts[0]["ID"]
         resp = requests.post(f"{BITRIX_WEBHOOK}/crm.deal.list.json",
-                             json={"filter": {"CONTACT_ID": contact_id},
+                             json={"filter": {"CONTACT_ID": contact_id, "CATEGORY_ID": SALE_CATEGORY_ID},
                                    "select": ["ID", "TITLE"], "order": {"ID": "DESC"}},
                              verify=False, timeout=30)
         resp.raise_for_status()
@@ -244,14 +245,20 @@ def fetch_deals_by_contacts(contact_ids):
     try:
         for i in range(0, len(contact_ids), 50):
             chunk = contact_ids[i:i + 50]
-            resp = requests.post(f"{BITRIX_WEBHOOK}/crm.deal.list.json",
-                                 json={"filter": {"CONTACT_ID": chunk},
-                                       "select": ["ID", "TITLE", "CONTACT_ID"],
-                                       "order": {"ID": "DESC"}},
-                                 verify=False, timeout=30)
-            resp.raise_for_status()
-            for d in resp.json().get("result", []):
-                deals_by_contact.setdefault(d["CONTACT_ID"], []).append(d)
+            start = 0
+            while True:
+                resp = requests.post(f"{BITRIX_WEBHOOK}/crm.deal.list.json",
+                                     json={"filter": {"CONTACT_ID": chunk, "CATEGORY_ID": SALE_CATEGORY_ID},
+                                           "select": ["ID", "TITLE", "CONTACT_ID"],
+                                           "order": {"ID": "DESC"}, "start": start},
+                                     verify=False, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                for d in data.get("result", []):
+                    deals_by_contact.setdefault(d["CONTACT_ID"], []).append(d)
+                if "next" not in data:
+                    break
+                start = data["next"]
     except Exception as e:
         print(f"Ошибка при запросе crm.deal.list: {e}")
     return deals_by_contact
